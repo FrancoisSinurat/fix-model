@@ -1,7 +1,13 @@
 fastapi
-uvicorn
-numpy
 pandas
-scikit-learn
-aiomysql
+numpy
 google-cloud-storage
+scikit-learn
+uvicorn
+sqlalchemy
+asyncpg
+psycopg2-binary
+python-dotenv
+pydantic
+passlib
+python-jose

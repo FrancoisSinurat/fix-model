@@ -10,7 +10,8 @@ COPY . .
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt && pip install google-cloud-storage
 # Expose port untuk API
-CMD python3 main_copy.py
+CMD ["python3", "main_copy.py"]
+
 
 
 
