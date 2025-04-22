@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Query, HTTPException
+from routes.auth import router as auth_router
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
@@ -7,7 +8,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.decomposition import TruncatedSVD
-from sync_to_db import save_courses_to_db, save_reviews_to_db, save_combine_df_to_db
+from auth import get_current_user
+from sync_to_db import save_courses_to_db, save_reviews_to_db, save_combine_df_to_db, sync_users_from_reviews
+from databases import User
 from google.cloud import storage
 import re
 from io import StringIO
@@ -23,12 +26,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(auth_router)
 
 # Konfigurasi Google Cloud Storage
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcp-key.json"
-storage_client = storage.Client()
-bucket_name = "sinitycourse-dataset"
 
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcp-key.json"
+storage_client = storage.Client()
+bucket_name = "sinity-bucket"
 # Cache dataset
 course_df = None
 users = None
@@ -58,8 +62,10 @@ def load_data():
     global course_df, users, scaled_ratings_df, cosine_sim_matrix, combine_df  
 
     try:
-        course_df = read_csv_from_gcs("Coursera_courses.csv")
-        reviews_df = read_csv_from_gcs("Coursera_reviews.csv")
+        course_df = read_csv_from_s3("Coursera_courses.csv")
+        print("Berhasil baca Coursera_courses.csv")
+        reviews_df = read_csv_from_s3("Coursera_reviews.csv")
+        print("Berhasil baca Coursera_reviews.csv")
     except HTTPException as e:
         logging.error(e.detail)
         return
@@ -88,7 +94,7 @@ def load_data():
     reviews_df.drop(columns=['reviews','date_reviews'], inplace=True)
     valid_users = reviews_df['reviewers'].value_counts(dropna=True)[lambda x: x >= 2].index
     users = reviews_df[reviews_df['reviewers'].isin(valid_users)].copy()
-    # users = users.sample(n=min(20000, len(users)), random_state=42)
+    users = users.sample(n=min(20000, len(users)), random_state=42)
     user_id_mapping = {user: idx for idx, user in enumerate(users['reviewers'].unique())}
     users['user_id'] = users['reviewers'].map(user_id_mapping)
     users['course_id_int'] = users['course_id'].map(course_df.set_index('course_id')['course_id_int'])
@@ -131,13 +137,12 @@ def load_data():
     scaled_ratings_df = pd.DataFrame(reduced_matrix, index=rating_matrix.index)
 
     logging.info("SVD dan scaling rating selesai.")
-
     logging.info("Dataset berhasil dimuat dan diproses!")
+    sync_users_from_reviews()
 
 
 # Load dataset pertama kali
 load_data()
-
 
 @app.get("/")
 def read_root():
@@ -155,7 +160,8 @@ async def get_all_courses():
 
 
 @app.get("/users", response_model=dict)
-def get_users(user_id: int = Query(..., title="User ID")):
+def get_users(current_user: User = Depends(get_current_user)):
+    user_id = current_user.user_id
     if users is None or combine_df is None:
         raise HTTPException(status_code=500, detail="Dataset belum dimuat.")
 
@@ -229,7 +235,8 @@ async def recommend_courses(course_name: str = Query(..., title="Nama Kursus")):
 
 
 @app.get("/recommend_for_user", response_model=dict)
-async def recommend_for_user(user_id: int = Query(..., title="User ID")):
+async def recommend_for_user(current_user: User = Depends(get_current_user)):
+    user_id = current_user.user_id
     if scaled_ratings_df is None or users is None or combine_df is None:
         raise HTTPException(status_code=500, detail="Dataset belum dimuat.")
 
@@ -277,6 +284,69 @@ async def recommend_for_user(user_id: int = Query(..., title="User ID")):
         ]
     }
 
+
+# ==========================
+#   Hybrid Recommendation
+# ==========================
+@app.get("/hybrid_recommendation", response_model=dict)
+async def hybrid_recommendation(alpha: float = Query(0.5, ge=0, le=1), current_user: User = Depends(get_current_user)):
+    user_id = current_user.user_id
+
+    if scaled_ratings_df is None or cosine_sim_matrix is None:
+        raise HTTPException(status_code=500, detail="Dataset belum dimuat.")
+    
+    if user_id not in scaled_ratings_df.index:
+        raise HTTPException(status_code=404, detail="User ID tidak ditemukan")
+
+    user_ratings = scaled_ratings_df.loc[user_id]
+    rated_courses = set(users[users['user_id'] == user_id]['course_id_int'])
+
+    if not rated_courses:
+        raise HTTPException(status_code=400, detail="User belum memiliki riwayat rating.")
+
+    # Collaborative
+    collab_scores = user_ratings.copy()
+    collab_scores = collab_scores.reindex(combine_df['course_id_int'], fill_value=0)
+    collab_scores_array = collab_scores.values.reshape(-1, 1)
+    collab_scores_scaled = MinMaxScaler((0, 5)).fit_transform(collab_scores_array).flatten()
+    collab_series = pd.Series(collab_scores_scaled, index=combine_df.index)
+
+
+    # Content-based
+    cb_scores = np.zeros(len(combine_df))
+    for course_int in rated_courses:
+        cb_scores += cosine_sim_matrix[course_int]
+    cb_scores /= len(rated_courses)
+
+    cb_series = pd.Series(cb_scores, index=combine_df.index)
+    scaler = MinMaxScaler((0, 5))
+    cb_series_scaled = scaler.fit_transform(cb_series.values.reshape(-1, 1)).flatten()
+    cb_series = pd.Series(cb_series_scaled, index=cb_series.index)
+
+    # Hybrid
+    hybrid_scores = alpha * collab_series + (1 - alpha) * cb_series
+    hybrid_series = pd.Series(hybrid_scores, index=combine_df.index)
+
+    rated_indexes = combine_df[combine_df['course_id_int'].isin(rated_courses)].index
+    hybrid_series = hybrid_series.drop(rated_indexes, errors='ignore')
+
+    top_indexes = hybrid_series.sort_values(ascending=False).head(5).index
+    recommended = combine_df.loc[top_indexes][['course_id', 'name', 'total_reviewers', 'average_rating']]
+
+
+    return {
+        "user_id": user_id,
+        "alpha": alpha,
+        "recommendations": [
+            {
+                "course_id": row["course_id"],
+                "name": row["name"],
+                "total_reviewers": row["total_reviewers"],
+                "average_rating": row["average_rating"]
+            }
+            for _, row in recommended.iterrows()
+        ]
+    }
 
 # ==========================
 #     Evaluate Model
@@ -385,77 +455,18 @@ def evaluate_recommendation(k: int = Query(5, ge=1, le=10)):
         "Total_samples": len(y_true)
     }
 
-# ==========================
-#   Hybrid Recommendation
-# ==========================
-@app.get("/hybrid_recommendation", response_model=dict)
-async def hybrid_recommendation(user_id: int = Query(...), alpha: float = Query(0.5, ge=0, le=1)):
-    if scaled_ratings_df is None or cosine_sim_matrix is None:
-        raise HTTPException(status_code=500, detail="Dataset belum dimuat.")
-    
-    if user_id not in scaled_ratings_df.index:
-        raise HTTPException(status_code=404, detail="User ID tidak ditemukan")
-
-    user_ratings = scaled_ratings_df.loc[user_id]
-    rated_courses = set(users[users['user_id'] == user_id]['course_id_int'])
-
-    if not rated_courses:
-        raise HTTPException(status_code=400, detail="User belum memiliki riwayat rating.")
-
-    # Collaborative
-    collab_scores = user_ratings.copy()
-    collab_scores = collab_scores.reindex(combine_df['course_id_int'], fill_value=0)
-    collab_scores_array = collab_scores.values.reshape(-1, 1)
-    collab_scores_scaled = MinMaxScaler((0, 5)).fit_transform(collab_scores_array).flatten()
-    collab_series = pd.Series(collab_scores_scaled, index=combine_df.index)
-
-
-    # Content-based
-    cb_scores = np.zeros(len(combine_df))
-    for course_int in rated_courses:
-        cb_scores += cosine_sim_matrix[course_int]
-    cb_scores /= len(rated_courses)
-
-    cb_series = pd.Series(cb_scores, index=combine_df.index)
-    scaler = MinMaxScaler((0, 5))
-    cb_series_scaled = scaler.fit_transform(cb_series.values.reshape(-1, 1)).flatten()
-    cb_series = pd.Series(cb_series_scaled, index=cb_series.index)
-
-    # Hybrid
-    hybrid_scores = alpha * cb_series + (1 - alpha) * collab_series
-    hybrid_series = pd.Series(hybrid_scores, index=combine_df.index)
-
-    rated_indexes = combine_df[combine_df['course_id_int'].isin(rated_courses)].index
-    hybrid_series = hybrid_series.drop(rated_indexes, errors='ignore')
-
-    top_indexes = hybrid_series.sort_values(ascending=False).head(5).index
-    recommended = combine_df.loc[top_indexes]
-
-    return {
-        "user_id": user_id,
-        "alpha": alpha,
-        "recommendations": [
-            {
-                "course_id": row["course_id"],
-                "name": row["name"],
-                "total_reviewers": row["total_reviewers"],
-                "average_rating": row["average_rating"]
-            }
-            for _, row in recommended.iterrows()
-        ]
-    }
-
 
 # ==========================
 #   Alias untuk Frontend
 # ==========================
 @app.get("/recommendations", response_model=dict)
-async def get_recommendations(user_id: int, alpha: float = Query(0.5, ge=0, le=1)):
+async def get_recommendations(alpha: float = Query(0.5, ge=0, le=1), current_user: User = Depends(get_current_user)):
     """
     Alias endpoint dari hybrid_recommendation untuk konsumsi frontend
     """
+    
     try:
-        return await hybrid_recommendation(user_id=user_id, alpha=alpha)
+        return await hybrid_recommendation(user_id=current_user.id, alpha=alpha)
     except HTTPException as e:
         raise e
     except Exception as e:
